@@ -18,10 +18,11 @@ import (
 
 // loginCmd represents the login command
 var loginCmd = &cobra.Command{
-	Use:    "login <profile>",
-	Short:  "login will authenticate you through okta and allow you to access your AWS environment through a browser",
-	RunE:   loginRun,
-	PreRun: loginPre,
+	Use:       "login <profile>",
+	Short:     "login will authenticate you through okta and allow you to access your AWS environment through a browser",
+	RunE:      loginRun,
+	PreRun:    loginPre,
+	ValidArgs: listProfileNames(mustListProfiles()),
 }
 
 // Stdout is the bool for -stdout
@@ -29,7 +30,7 @@ var Stdout bool
 
 func init() {
 	RootCmd.AddCommand(loginCmd)
-	loginCmd.Flags().BoolVarP(&Stdout, "stdout", "", false, "Print login URL to stdout instead of opening in default browser")
+	loginCmd.Flags().BoolVarP(&Stdout, "stdout", "s", false, "Print login URL to stdout instead of opening in default browser")
 	loginCmd.Flags().DurationVarP(&sessionTTL, "session-ttl", "t", time.Hour, "Expiration time for okta role session")
 	loginCmd.Flags().DurationVarP(&assumeRoleTTL, "assume-role-ttl", "a", time.Hour, "Expiration time for assumed role")
 }
@@ -64,11 +65,28 @@ func loginRun(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if _, ok := profiles[profile]; !ok {
+	prof, ok := profiles[profile]
+	if !ok {
 		return fmt.Errorf("Profile '%s' not found in your aws config", profile)
 	}
 
+	updateMfaConfig(cmd, profiles, profile, &mfaConfig)
+
+	// check profile for both session durations if not explicitly set
+	if !cmd.Flags().Lookup("assume-role-ttl").Changed {
+		if err := updateDurationFromConfigProfile(profiles, profile, "assume_role_ttl", &assumeRoleTTL); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: could not parse assume_role_ttl from profile config")
+		}
+	}
+
+	if !cmd.Flags().Lookup("session-ttl").Changed {
+		if err := updateDurationFromConfigProfile(profiles, profile, "session_ttl", &sessionTTL); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: could not parse session_ttl from profile config")
+		}
+	}
+
 	opts := lib.ProviderOptions{
+		MFAConfig:          mfaConfig,
 		Profiles:           profiles,
 		SessionDuration:    sessionTTL,
 		AssumeRoleDuration: assumeRoleTTL,
@@ -95,11 +113,35 @@ func loginRun(cmd *cobra.Command, args []string) error {
 		})
 	}
 
+	opts.SessionCacheSingleItem = flagSessionCacheSingleItem
+
 	p, err := lib.NewProvider(kr, profile, opts)
 	if err != nil {
 		return err
 	}
 
+	if _, ok := prof["aws_saml_url"]; ok {
+		return oktaLogin(p)
+	}
+	return federatedLogin(p, profile, profiles)
+}
+
+func oktaLogin(p *lib.Provider) error {
+	loginURL, err := p.GetSAMLLoginURL()
+	if err != nil {
+		return err
+	}
+
+	if Stdout {
+		fmt.Println(loginURL.String())
+	} else if err := open.Run(loginURL.String()); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func federatedLogin(p *lib.Provider, profile string, profiles lib.Profiles) error {
 	creds, err := p.Retrieve()
 	if err != nil {
 		return err

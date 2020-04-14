@@ -4,12 +4,19 @@ import (
 	"encoding/json"
 	"fmt"
 
-	log "github.com/Sirupsen/logrus"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/99designs/keyring"
 	analytics "github.com/segmentio/analytics-go"
 	"github.com/segmentio/aws-okta/lib"
 	"github.com/spf13/cobra"
+)
+
+var (
+	organization    string
+	oktaDomain      string
+	oktaRegion      string
+	oktaAccountName string
 )
 
 // addCmd represents the add command
@@ -21,6 +28,9 @@ var addCmd = &cobra.Command{
 
 func init() {
 	RootCmd.AddCommand(addCmd)
+	addCmd.Flags().StringVarP(&oktaDomain, "domain", "", "", "Okta domain (e.g. <orgname>.okta.com)")
+	addCmd.Flags().StringVarP(&username, "username", "", "", "Okta username")
+	addCmd.Flags().StringVarP(&oktaAccountName, "account", "", "", "Okta account name")
 }
 
 func add(cmd *cobra.Command, args []string) error {
@@ -45,17 +55,51 @@ func add(cmd *cobra.Command, args []string) error {
 		})
 	}
 
-	// Ask username password from prompt
-	organization, err := lib.Prompt("Okta organization", false)
-	if err != nil {
-		return err
+	// Ask Okta organization details if not given in command line argument
+	if oktaDomain == "" {
+		organization, err = lib.Prompt("Okta organization", false)
+		if err != nil {
+			return err
+		}
+
+		oktaRegion, err = lib.Prompt("Okta region ([us], emea, preview)", false)
+		if err != nil {
+			return err
+		}
+		if oktaRegion == "" {
+			oktaRegion = "us"
+		}
+
+		tld, err := lib.GetOktaDomain(oktaRegion)
+		if err != nil {
+			return err
+		}
+		defaultOktaDomain := fmt.Sprintf("%s.%s", organization, tld)
+
+		oktaDomain, err = lib.Prompt("Okta domain ["+defaultOktaDomain+"]", false)
+		if err != nil {
+			return err
+		}
+		if oktaDomain == "" {
+			oktaDomain = defaultOktaDomain
+		}
 	}
 
-	username, err := lib.Prompt("Okta username", false)
-	if err != nil {
-		return err
+	if username == "" {
+		username, err = lib.Prompt("Okta username", false)
+		if err != nil {
+			return err
+		}
 	}
+	
+	if oktaAccountName == "" {
+	    oktaAccountName = "okta-creds"
+	} else {
+	    oktaAccountName = "okta-creds-" + oktaAccountName
+	}
+	log.Debugf("Keyring key: %s", oktaAccountName)
 
+	// Ask for password from prompt
 	password, err := lib.Prompt("Okta password", true)
 	if err != nil {
 		return err
@@ -66,9 +110,15 @@ func add(cmd *cobra.Command, args []string) error {
 		Organization: organization,
 		Username:     username,
 		Password:     password,
+		Domain:       oktaDomain,
 	}
 
-	if err := creds.Validate(); err != nil {
+	// Profiles aren't parsed during `add`, but still want
+	// to centralize the MFA config logic
+	var dummyProfiles lib.Profiles
+	updateMfaConfig(cmd, dummyProfiles, "", &mfaConfig)
+
+	if err := creds.Validate(mfaConfig); err != nil {
 		log.Debugf("Failed to validate credentials: %s", err)
 		return ErrFailedToValidateCredentials
 	}
@@ -79,9 +129,9 @@ func add(cmd *cobra.Command, args []string) error {
 	}
 
 	item := keyring.Item{
-		Key:   "okta-creds",
-		Data:  encoded,
-		Label: "okta credentials",
+		Key:                         oktaAccountName,
+		Data:                        encoded,
+		Label:                       "okta credentials",
 		KeychainNotTrustApplication: false,
 	}
 

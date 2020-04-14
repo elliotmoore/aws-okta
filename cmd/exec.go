@@ -2,6 +2,9 @@ package cmd
 
 import (
 	"fmt"
+
+	log "github.com/sirupsen/logrus"
+
 	"os"
 	"os/exec"
 	"os/signal"
@@ -18,20 +21,31 @@ import (
 var (
 	sessionTTL    time.Duration
 	assumeRoleTTL time.Duration
+	assumeRoleARN string
 )
+
+func mustListProfiles() lib.Profiles {
+	profiles, err := listProfiles()
+	if err != nil {
+		log.Panicf("Failed to list profiles: %v", err)
+	}
+	return profiles
+}
 
 // execCmd represents the exec command
 var execCmd = &cobra.Command{
-	Use:    "exec <profile> -- <command>",
-	Short:  "exec will run the command specified with aws credentials set in the environment",
-	RunE:   execRun,
-	PreRun: execPre,
+	Use:       "exec <profile> -- <command>",
+	Short:     "exec will run the command specified with aws credentials set in the environment",
+	RunE:      execRun,
+	PreRun:    execPre,
+	ValidArgs: listProfileNames(mustListProfiles()),
 }
 
 func init() {
 	RootCmd.AddCommand(execCmd)
 	execCmd.Flags().DurationVarP(&sessionTTL, "session-ttl", "t", time.Hour, "Expiration time for okta role session")
 	execCmd.Flags().DurationVarP(&assumeRoleTTL, "assume-role-ttl", "a", time.Hour, "Expiration time for assumed role")
+	execCmd.Flags().StringVarP(&assumeRoleARN, "assume-role-arn", "r", "", "Role arn to assume, overrides arn in profile")
 }
 
 func loadDurationFlagFromEnv(cmd *cobra.Command, flagName string, envVar string, val *time.Duration) error {
@@ -49,6 +63,37 @@ func loadDurationFlagFromEnv(cmd *cobra.Command, flagName string, envVar string,
 		return err
 	}
 
+	cmd.Flags().Lookup(flagName).Changed = true
+	*val = dur
+	return nil
+}
+
+func loadStringFlagFromEnv(cmd *cobra.Command, flagName string, envVar string, val *string) error {
+	if cmd.Flags().Lookup(flagName).Changed {
+		return nil
+	}
+
+	fromEnv, ok := os.LookupEnv(envVar)
+	if !ok {
+		return nil
+	}
+
+	cmd.Flags().Lookup(flagName).Changed = true
+	*val = fromEnv
+	return nil
+}
+
+func updateDurationFromConfigProfile(profiles lib.Profiles, profile string, key string, val *time.Duration) error {
+	fromProfile, _, err := profiles.GetValue(profile, key)
+	if err != nil {
+		return nil
+	}
+
+	dur, err := time.ParseDuration(fromProfile)
+	if err != nil {
+		return err
+	}
+
 	*val = dur
 	return nil
 }
@@ -60,6 +105,9 @@ func execPre(cmd *cobra.Command, args []string) {
 
 	if err := loadDurationFlagFromEnv(cmd, "assume-role-ttl", "AWS_ASSUME_ROLE_TTL", &assumeRoleTTL); err != nil {
 		fmt.Fprintln(os.Stderr, "warning: failed to parse duration from AWS_ASSUME_ROLE_TTL")
+	}
+	if err := loadStringFlagFromEnv(cmd, "assume-role-arn", "AWS_ASSUME_ROLE_ARN", &assumeRoleARN); err != nil {
+		fmt.Fprintln(os.Stderr, "warning: failed to parse duration from AWS_ASSUME_ROLE_ARN")
 	}
 }
 
@@ -97,13 +145,30 @@ func execRun(cmd *cobra.Command, args []string) error {
 	}
 
 	if _, ok := profiles[profile]; !ok {
-		return fmt.Errorf("Profile '%s' not found in your aws config", profile)
+		return fmt.Errorf("Profile '%s' not found in your aws config. Use list command to see configured profiles.", profile)
+	}
+
+	updateMfaConfig(cmd, profiles, profile, &mfaConfig)
+
+	// check profile for both session durations if not explicitly set
+	if !cmd.Flags().Lookup("assume-role-ttl").Changed {
+		if err := updateDurationFromConfigProfile(profiles, profile, "assume_role_ttl", &assumeRoleTTL); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: could not parse assume_role_ttl from profile config")
+		}
+	}
+
+	if !cmd.Flags().Lookup("session-ttl").Changed {
+		if err := updateDurationFromConfigProfile(profiles, profile, "session_ttl", &sessionTTL); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: could not parse session_ttl from profile config")
+		}
 	}
 
 	opts := lib.ProviderOptions{
+		MFAConfig:          mfaConfig,
 		Profiles:           profiles,
 		SessionDuration:    sessionTTL,
 		AssumeRoleDuration: assumeRoleTTL,
+		AssumeRoleArn:      assumeRoleARN,
 	}
 
 	var allowedBackends []keyring.BackendType
@@ -128,6 +193,8 @@ func execRun(cmd *cobra.Command, args []string) error {
 		})
 	}
 
+	opts.SessionCacheSingleItem = flagSessionCacheSingleItem
+
 	p, err := lib.NewProvider(kr, profile, opts)
 	if err != nil {
 		return err
@@ -137,6 +204,12 @@ func execRun(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+
+	roleARN, err := p.GetRoleARNWithRegion(creds)
+	if err != nil {
+		return err
+	}
+	role := strings.Split(roleARN, "/")[1]
 
 	env := environ(os.Environ())
 	env.Unset("AWS_ACCESS_KEY_ID")
@@ -154,11 +227,15 @@ func execRun(cmd *cobra.Command, args []string) error {
 	env.Set("AWS_ACCESS_KEY_ID", creds.AccessKeyID)
 	env.Set("AWS_SECRET_ACCESS_KEY", creds.SecretAccessKey)
 	env.Set("AWS_OKTA_PROFILE", profile)
+	env.Set("AWS_OKTA_ASSUMED_ROLE_ARN", roleARN)
+	env.Set("AWS_OKTA_ASSUMED_ROLE", role)
 
 	if creds.SessionToken != "" {
 		env.Set("AWS_SESSION_TOKEN", creds.SessionToken)
 		env.Set("AWS_SECURITY_TOKEN", creds.SessionToken)
 	}
+
+	env.Set("AWS_OKTA_SESSION_EXPIRATION", fmt.Sprintf("%d", p.GetExpiration().Unix()))
 
 	ecmd := exec.Command(command, commandArgs...)
 	ecmd.Stdin = os.Stdin

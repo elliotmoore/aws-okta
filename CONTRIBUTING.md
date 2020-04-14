@@ -1,0 +1,1 @@
+aws-okta is on indefinite hiatus. See [https://github.com/segmentio/aws-okta/issues/278](#278) for details. Specifically, no new features will be added, and only critical, straight-forward bugfixes will be accepted.
